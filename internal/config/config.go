@@ -204,6 +204,12 @@ type DroidKey struct {
 
 	// ExcludedModels lists model IDs that should be excluded for this provider.
 	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
+
+	// PoolEnabled enables the process pool for faster request handling.
+	PoolEnabled bool `yaml:"pool-enabled,omitempty" json:"pool-enabled,omitempty"`
+
+	// PoolSize sets the number of persistent droid processes (default: 3).
+	PoolSize int `yaml:"pool-size,omitempty" json:"pool-size,omitempty"`
 }
 
 // GeminiKey represents the configuration for a Gemini API key,

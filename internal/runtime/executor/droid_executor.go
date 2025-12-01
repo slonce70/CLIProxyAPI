@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -21,10 +22,49 @@ import (
 type DroidExecutor struct {
 	cfg       *config.Config
 	droidPath string
+	pool      *DroidProcessPool
+	poolMu    sync.Mutex
 }
 
 func NewDroidExecutor(cfg *config.Config) *DroidExecutor {
 	return &DroidExecutor{cfg: cfg, droidPath: "droid"}
+}
+
+// InitPool initializes the process pool for faster request handling
+func (e *DroidExecutor) InitPool(apiKey, model string, size int) error {
+	e.poolMu.Lock()
+	defer e.poolMu.Unlock()
+
+	if e.pool != nil {
+		e.pool.Close()
+	}
+
+	cwd, _ := os.Getwd()
+	e.pool = NewDroidProcessPool(size, apiKey, model, cwd)
+	log.Infof("droid: initialized process pool with size %d", size)
+	return nil
+}
+
+// ClosePool shuts down the process pool
+func (e *DroidExecutor) ClosePool() {
+	e.poolMu.Lock()
+	defer e.poolMu.Unlock()
+
+	if e.pool != nil {
+		e.pool.Close()
+		e.pool = nil
+	}
+}
+
+// PoolStats returns pool statistics (total, busy, idle)
+func (e *DroidExecutor) PoolStats() (total, busy, idle int) {
+	e.poolMu.Lock()
+	defer e.poolMu.Unlock()
+
+	if e.pool != nil {
+		return e.pool.Stats()
+	}
+	return 0, 0, 0
 }
 
 func (e *DroidExecutor) Identifier() string { return "droid" }
@@ -40,6 +80,19 @@ func (e *DroidExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return cliproxyexecutor.Response{}, fmt.Errorf("droid: failed to extract prompt: %w", err)
 	}
 
+	// Try pool-based execution first (much faster)
+	if result, err := e.executeWithPool(ctx, apiKey, model, prompt); err == nil {
+		response := convertDroidToOpenAIResponse(result, model)
+		payload, err := json.Marshal(response)
+		if err != nil {
+			return cliproxyexecutor.Response{}, fmt.Errorf("droid: failed to marshal response: %w", err)
+		}
+		return cliproxyexecutor.Response{Payload: payload}, nil
+	} else {
+		log.Debugf("droid: pool execution failed, falling back to subprocess: %v", err)
+	}
+
+	// Fallback to subprocess execution
 	result, err := executeDroidJSON(ctx, e.droidPath, apiKey, model, reasoningEffort, prompt)
 	if err != nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("droid: execution failed: %w", err)
@@ -52,6 +105,58 @@ func (e *DroidExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 
 	return cliproxyexecutor.Response{Payload: payload}, nil
+}
+
+// executeWithPool tries to execute using the process pool
+func (e *DroidExecutor) executeWithPool(ctx context.Context, apiKey, model, prompt string) (*droidJSONResult, error) {
+	e.poolMu.Lock()
+	pool := e.pool
+
+	// Lazy initialization of pool if enabled in config
+	if pool == nil && e.cfg != nil && len(e.cfg.DroidKey) > 0 {
+		droidCfg := e.cfg.DroidKey[0]
+		if droidCfg.PoolEnabled {
+			poolSize := droidCfg.PoolSize
+			if poolSize <= 0 {
+				poolSize = 3
+			}
+			cwd, _ := os.Getwd()
+			pool = NewDroidProcessPool(poolSize, apiKey, model, cwd)
+			e.pool = pool
+			log.Infof("droid: lazy-initialized process pool with size %d", poolSize)
+		}
+	}
+	e.poolMu.Unlock()
+
+	if pool == nil {
+		return nil, fmt.Errorf("pool not initialized or disabled")
+	}
+
+	worker, err := pool.Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to acquire worker: %w", err)
+	}
+
+	startTime := time.Now()
+	response, err := worker.SendMessage(ctx, prompt)
+	duration := time.Since(startTime)
+
+	if err != nil {
+		pool.ReleaseWithError(worker, err)
+		return nil, err
+	}
+
+	pool.Release(worker)
+
+	return &droidJSONResult{
+		Type:       "result",
+		Subtype:    "success",
+		IsError:    false,
+		DurationMs: duration.Milliseconds(),
+		NumTurns:   1,
+		Result:     response,
+		SessionID:  worker.sessionID,
+	}, nil
 }
 
 func (e *DroidExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (<-chan cliproxyexecutor.StreamChunk, error) {
