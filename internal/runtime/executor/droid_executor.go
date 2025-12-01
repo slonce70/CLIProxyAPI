@@ -339,6 +339,10 @@ func executeDroidJSON(ctx context.Context, droidPath, apiKey, model, reasoningEf
 		}
 	}
 
+	// Disable tools to reduce LLM prompt size and improve response time (~1 sec faster)
+	// Tool names from: droid exec --list-tools
+	args = append(args, "--disabled-tools", "Read,LS,Execute,Grep,Glob,WebSearch,FetchUrl,TodoWrite")
+
 	// Pass prompt via stdin to avoid Windows command line length limits
 	// Only add prompt as argument if it's short enough
 	if len(prompt) < 4000 {
@@ -472,6 +476,10 @@ func executeDroidStreamJSON(ctx context.Context, droidPath, apiKey, model, reaso
 			args = append(args, "-r", "off")
 		}
 	}
+
+	// Disable tools to reduce LLM prompt size and improve response time (~1 sec faster)
+	// Tool names from: droid exec --list-tools
+	args = append(args, "--disabled-tools", "Read,LS,Execute,Grep,Glob,WebSearch,FetchUrl,TodoWrite")
 
 	// Pass prompt via stdin to avoid Windows command line length limits
 	if len(prompt) < 4000 {
