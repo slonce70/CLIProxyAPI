@@ -332,7 +332,13 @@ func executeDroidJSON(ctx context.Context, droidPath, apiKey, model, reasoningEf
 	}
 	if reasoningEffort != "" {
 		args = append(args, "-r", reasoningEffort)
+	} else {
+		// Disable reasoning by default for faster responses (except GLM which doesn't support it)
+		if model != "glm-4.6" {
+			args = append(args, "-r", "off")
+		}
 	}
+
 	// Pass prompt via stdin to avoid Windows command line length limits
 	// Only add prompt as argument if it's short enough
 	if len(prompt) < 4000 {
@@ -460,7 +466,13 @@ func executeDroidStreamJSON(ctx context.Context, droidPath, apiKey, model, reaso
 	}
 	if reasoningEffort != "" {
 		args = append(args, "-r", reasoningEffort)
+	} else {
+		// Disable reasoning by default for faster responses (except GLM which doesn't support it)
+		if model != "glm-4.6" {
+			args = append(args, "-r", "off")
+		}
 	}
+
 	// Pass prompt via stdin to avoid Windows command line length limits
 	if len(prompt) < 4000 {
 		args = append(args, prompt)
