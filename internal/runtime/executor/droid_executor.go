@@ -256,10 +256,54 @@ func executeDroidJSON(ctx context.Context, droidPath, apiKey, model, reasoningEf
 	}
 
 	if result.IsError {
-		return nil, fmt.Errorf("droid error: %s", result.Result)
+		return nil, newDroidError(result.Result)
 	}
 
 	return &result, nil
+}
+
+// droidError represents an error from the Droid CLI with HTTP status code mapping
+type droidError struct {
+	message    string
+	statusCode int
+}
+
+func (e *droidError) Error() string {
+	return e.message
+}
+
+func (e *droidError) StatusCode() int {
+	return e.statusCode
+}
+
+// newDroidError creates a droidError with appropriate HTTP status code based on error message
+func newDroidError(msg string) *droidError {
+	lowerMsg := strings.ToLower(msg)
+
+	// Balance/billing errors -> 402 Payment Required
+	if strings.Contains(lowerMsg, "billing") ||
+		strings.Contains(lowerMsg, "reload your tokens") ||
+		strings.Contains(lowerMsg, "balance") ||
+		strings.Contains(lowerMsg, "insufficient") {
+		return &droidError{message: "droid error: " + msg, statusCode: 402}
+	}
+
+	// Rate limit errors -> 429 Too Many Requests
+	if strings.Contains(lowerMsg, "rate limit") ||
+		strings.Contains(lowerMsg, "too many requests") ||
+		strings.Contains(lowerMsg, "quota") {
+		return &droidError{message: "droid error: " + msg, statusCode: 429}
+	}
+
+	// Auth errors -> 401 Unauthorized
+	if strings.Contains(lowerMsg, "unauthorized") ||
+		strings.Contains(lowerMsg, "invalid api key") ||
+		strings.Contains(lowerMsg, "authentication") {
+		return &droidError{message: "droid error: " + msg, statusCode: 401}
+	}
+
+	// Default -> 500 Internal Server Error
+	return &droidError{message: "droid error: " + msg, statusCode: 500}
 }
 
 type droidOpenAIResponse struct {
