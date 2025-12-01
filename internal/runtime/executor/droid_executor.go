@@ -35,12 +35,12 @@ func (e *DroidExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return cliproxyexecutor.Response{}, fmt.Errorf("droid: missing FACTORY_API_KEY")
 	}
 
-	prompt, model, err := extractDroidPromptAndModel(req.Payload, req.Model)
+	prompt, model, reasoningEffort, err := extractDroidPromptAndModel(req.Payload, req.Model)
 	if err != nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("droid: failed to extract prompt: %w", err)
 	}
 
-	result, err := executeDroidJSON(ctx, e.droidPath, apiKey, model, prompt)
+	result, err := executeDroidJSON(ctx, e.droidPath, apiKey, model, reasoningEffort, prompt)
 	if err != nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("droid: execution failed: %w", err)
 	}
@@ -60,7 +60,7 @@ func (e *DroidExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, fmt.Errorf("droid: missing FACTORY_API_KEY")
 	}
 
-	prompt, model, err := extractDroidPromptAndModel(req.Payload, req.Model)
+	prompt, model, reasoningEffort, err := extractDroidPromptAndModel(req.Payload, req.Model)
 	if err != nil {
 		return nil, fmt.Errorf("droid: failed to extract prompt: %w", err)
 	}
@@ -69,7 +69,7 @@ func (e *DroidExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	go func() {
 		defer close(ch)
-		if err := executeDroidStreamJSON(ctx, e.droidPath, apiKey, model, prompt, ch); err != nil {
+		if err := executeDroidStreamJSON(ctx, e.droidPath, apiKey, model, reasoningEffort, prompt, ch); err != nil {
 			ch <- cliproxyexecutor.StreamChunk{Err: err}
 		}
 	}()
@@ -104,20 +104,20 @@ type droidOpenAIMessage struct {
 	Content string `json:"content"`
 }
 
-func extractDroidPromptAndModel(payload []byte, defaultModel string) (string, string, error) {
+func extractDroidPromptAndModel(payload []byte, defaultModel string) (prompt string, model string, reasoningEffort string, err error) {
 	var req droidOpenAIRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
-	model := req.Model
+	model = req.Model
 	if model == "" {
 		model = defaultModel
 	}
 	if model == "" {
 		model = "claude-opus-4-5-20251101"
 	}
-	model = mapDroidModel(model)
+	model, reasoningEffort = mapDroidModel(model)
 
 	// Build prompt preserving conversation context
 	// Format that LLMs understand well for multi-turn conversations
@@ -177,10 +177,20 @@ func extractDroidPromptAndModel(payload []byte, defaultModel string) (string, st
 		}
 	}
 
-	return strings.TrimSpace(promptBuilder.String()), model, nil
+	return strings.TrimSpace(promptBuilder.String()), model, reasoningEffort, nil
 }
 
-func mapDroidModel(model string) string {
+// mapDroidModel returns the native model name and reasoning effort level.
+// Models with -thinking suffix get "high" reasoning, others get empty (use defaults).
+func mapDroidModel(model string) (nativeModel string, reasoningEffort string) {
+	// Check for thinking suffix first
+	reasoningEffort = ""
+	baseModel := model
+	if strings.HasSuffix(model, "-thinking") {
+		reasoningEffort = "high"
+		baseModel = strings.TrimSuffix(model, "-thinking")
+	}
+
 	modelMap := map[string]string{
 		"droid-glm-4.6":           "glm-4.6",
 		"droid-claude-haiku-4.5":  "claude-haiku-4-5-20251001",
@@ -189,10 +199,15 @@ func mapDroidModel(model string) string {
 		"droid-gpt-5.1-codex":     "gpt-5.1-codex",
 		"droid-gemini-3-pro":      "gemini-3-pro-preview",
 	}
-	if native, ok := modelMap[model]; ok {
-		return native
+
+	if native, ok := modelMap[baseModel]; ok {
+		// GLM-4.6 doesn't support reasoning, clear it
+		if native == "glm-4.6" {
+			reasoningEffort = ""
+		}
+		return native, reasoningEffort
 	}
-	return model
+	return model, reasoningEffort
 }
 
 type droidJSONResult struct {
@@ -205,10 +220,13 @@ type droidJSONResult struct {
 	SessionID  string `json:"session_id"`
 }
 
-func executeDroidJSON(ctx context.Context, droidPath, apiKey, model, prompt string) (*droidJSONResult, error) {
+func executeDroidJSON(ctx context.Context, droidPath, apiKey, model, reasoningEffort, prompt string) (*droidJSONResult, error) {
 	args := []string{"exec", "-o", "json"}
 	if model != "" {
 		args = append(args, "-m", model)
+	}
+	if reasoningEffort != "" {
+		args = append(args, "-r", reasoningEffort)
 	}
 	args = append(args, prompt)
 
@@ -277,10 +295,13 @@ type droidStreamEvent struct {
 	Model     string `json:"model,omitempty"`
 }
 
-func executeDroidStreamJSON(ctx context.Context, droidPath, apiKey, model, prompt string, ch chan<- cliproxyexecutor.StreamChunk) error {
+func executeDroidStreamJSON(ctx context.Context, droidPath, apiKey, model, reasoningEffort, prompt string, ch chan<- cliproxyexecutor.StreamChunk) error {
 	args := []string{"exec", "-o", "stream-json"}
 	if model != "" {
 		args = append(args, "-m", model)
+	}
+	if reasoningEffort != "" {
+		args = append(args, "-r", reasoningEffort)
 	}
 	args = append(args, prompt)
 
