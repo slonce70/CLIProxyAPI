@@ -228,10 +228,19 @@ func executeDroidJSON(ctx context.Context, droidPath, apiKey, model, reasoningEf
 	if reasoningEffort != "" {
 		args = append(args, "-r", reasoningEffort)
 	}
-	args = append(args, prompt)
+	// Pass prompt via stdin to avoid Windows command line length limits
+	// Only add prompt as argument if it's short enough
+	if len(prompt) < 4000 {
+		args = append(args, prompt)
+	}
 
 	cmd := exec.CommandContext(ctx, droidPath, args...)
 	cmd.Env = append(os.Environ(), "FACTORY_API_KEY="+apiKey)
+
+	// For long prompts, pass via stdin
+	if len(prompt) >= 4000 {
+		cmd.Stdin = strings.NewReader(prompt)
+	}
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -303,10 +312,18 @@ func executeDroidStreamJSON(ctx context.Context, droidPath, apiKey, model, reaso
 	if reasoningEffort != "" {
 		args = append(args, "-r", reasoningEffort)
 	}
-	args = append(args, prompt)
+	// Pass prompt via stdin to avoid Windows command line length limits
+	if len(prompt) < 4000 {
+		args = append(args, prompt)
+	}
 
 	cmd := exec.CommandContext(ctx, droidPath, args...)
 	cmd.Env = append(os.Environ(), "FACTORY_API_KEY="+apiKey)
+
+	// For long prompts, pass via stdin
+	if len(prompt) >= 4000 {
+		cmd.Stdin = strings.NewReader(prompt)
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
