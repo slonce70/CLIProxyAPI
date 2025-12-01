@@ -119,20 +119,61 @@ func extractDroidPromptAndModel(payload []byte, defaultModel string) (string, st
 	}
 	model = mapDroidModel(model)
 
+	// Build prompt preserving conversation context
+	// Format that LLMs understand well for multi-turn conversations
 	var promptBuilder strings.Builder
+	var systemPrompt string
+	var hasHistory bool
+
+	// Extract system prompt first
 	for _, msg := range req.Messages {
-		switch msg.Role {
-		case "system":
-			promptBuilder.WriteString("System: ")
-			promptBuilder.WriteString(msg.Content)
-			promptBuilder.WriteString("\n\n")
-		case "user":
-			promptBuilder.WriteString(msg.Content)
-			promptBuilder.WriteString("\n")
-		case "assistant":
-			promptBuilder.WriteString("Assistant: ")
-			promptBuilder.WriteString(msg.Content)
-			promptBuilder.WriteString("\n\n")
+		if msg.Role == "system" {
+			systemPrompt = msg.Content
+			break
+		}
+	}
+
+	// Check if we have conversation history (more than just the last user message)
+	userMsgCount := 0
+	for _, msg := range req.Messages {
+		if msg.Role == "user" || msg.Role == "assistant" {
+			userMsgCount++
+		}
+	}
+	hasHistory = userMsgCount > 1
+
+	// Add system prompt if present
+	if systemPrompt != "" {
+		promptBuilder.WriteString("<system>\n")
+		promptBuilder.WriteString(systemPrompt)
+		promptBuilder.WriteString("\n</system>\n\n")
+	}
+
+	// Add conversation history if present
+	if hasHistory {
+		promptBuilder.WriteString("<conversation_history>\n")
+		for _, msg := range req.Messages {
+			switch msg.Role {
+			case "system":
+				continue // Already handled
+			case "user":
+				promptBuilder.WriteString("[User]: ")
+				promptBuilder.WriteString(msg.Content)
+				promptBuilder.WriteString("\n\n")
+			case "assistant":
+				promptBuilder.WriteString("[Assistant]: ")
+				promptBuilder.WriteString(msg.Content)
+				promptBuilder.WriteString("\n\n")
+			}
+		}
+		promptBuilder.WriteString("</conversation_history>\n\n")
+		promptBuilder.WriteString("Continue the conversation. Respond to the last user message.")
+	} else {
+		// Single message - just use it directly
+		for _, msg := range req.Messages {
+			if msg.Role == "user" {
+				promptBuilder.WriteString(msg.Content)
+			}
 		}
 	}
 
