@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,6 +32,10 @@ type DroidWorker struct {
 	lastUsed     time.Time
 	mu           sync.Mutex
 	msgID        int64
+	// Background reader for stdout to prevent pipe blocking
+	lineChan     chan string
+	errChan      chan error
+	stopReader   chan struct{}
 }
 
 // DroidProcessPool manages a pool of persistent droid processes
@@ -82,17 +87,33 @@ type initSessionResult struct {
 	SessionID string `json:"sessionId"`
 }
 
-type streamEvent struct {
-	Type      string `json:"type"`
-	Subtype   string `json:"subtype,omitempty"`
-	FinalText string `json:"finalText,omitempty"`
-	Text      string `json:"text,omitempty"`
-	Role      string `json:"role,omitempty"`
-	IsError   bool   `json:"is_error,omitempty"`
-	Error     *struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-	} `json:"error,omitempty"`
+type jsonRPCNotification struct {
+	JSONRPC           string              `json:"jsonrpc"`
+	FactoryAPIVersion string              `json:"factoryApiVersion"`
+	Type              string              `json:"type"`
+	Method            string              `json:"method"`
+	Params            jsonRPCNotificationParams `json:"params"`
+}
+
+type jsonRPCNotificationParams struct {
+	Notification jsonRPCNotificationPayload `json:"notification"`
+}
+
+type jsonRPCNotificationPayload struct {
+	Type     string          `json:"type"`
+	NewState string          `json:"newState,omitempty"` // for droid_working_state_changed
+	Message  *jsonRPCMessage `json:"message,omitempty"`  // for create_message
+}
+
+type jsonRPCMessage struct {
+	ID      string               `json:"id"`
+	Role    string               `json:"role"`
+	Content []jsonRPCMessageContent `json:"content"`
+}
+
+type jsonRPCMessageContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
 // NewDroidProcessPool creates a new pool of droid workers
@@ -268,9 +289,16 @@ func (p *DroidProcessPool) createWorker(ctx context.Context) (*DroidWorker, erro
 	}
 	if p.model != "" {
 		args = append(args, "-m", p.model)
+		// Disable reasoning for non-GLM models (faster responses)
+		if p.model != "glm-4.6" {
+			args = append(args, "-r", "off")
+		}
 	}
+	// Disable all tools for chat-only mode
+	args = append(args, "--disabled-tools", droidDisabledTools)
 
-	cmd := exec.CommandContext(ctx, "droid", args...)
+	// Use background context for the process - it should live beyond any single request
+	cmd := exec.Command("droid", args...)
 	cmd.Env = append(os.Environ(), "FACTORY_API_KEY="+p.apiKey)
 	cmd.Dir = p.cwd
 
@@ -300,16 +328,22 @@ func (p *DroidProcessPool) createWorker(ctx context.Context) (*DroidWorker, erro
 	}
 
 	worker := &DroidWorker{
-		id:       id,
-		cmd:      cmd,
-		stdin:    stdin,
-		stdout:   bufio.NewReader(stdout),
-		stderr:   stderr,
-		apiKey:   p.apiKey,
-		model:    p.model,
-		cwd:      p.cwd,
-		lastUsed: time.Now(),
+		id:         id,
+		cmd:        cmd,
+		stdin:      stdin,
+		stdout:     bufio.NewReader(stdout),
+		stderr:     stderr,
+		apiKey:     p.apiKey,
+		model:      p.model,
+		cwd:        p.cwd,
+		lastUsed:   time.Now(),
+		lineChan:   make(chan string, 100),
+		errChan:    make(chan error, 1),
+		stopReader: make(chan struct{}),
 	}
+
+	// Start background reader to prevent pipe blocking
+	go worker.backgroundReader()
 
 	// Initialize session
 	if err := worker.initSession(ctx); err != nil {
@@ -403,54 +437,32 @@ func (w *DroidWorker) sendRequest(req jsonRPCRequest) error {
 }
 
 func (w *DroidWorker) readResponse(ctx context.Context, expectedID string) (*jsonRPCResponse, error) {
-	type readResult struct {
-		line string
-		err  error
-	}
+	// Enforce a global timeout for reading the response
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		default:
-		}
-
-		// Read with timeout using goroutine
-		lineCh := make(chan readResult, 1)
-		go func() {
-			line, err := w.stdout.ReadString('\n')
-			lineCh <- readResult{line, err}
-		}()
-
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(30 * time.Second):
-			return nil, fmt.Errorf("timeout waiting for response")
-		case result := <-lineCh:
-			if result.err != nil {
-				return nil, fmt.Errorf("failed to read response: %w", result.err)
-			}
-
+		case err := <-w.errChan:
+			return nil, fmt.Errorf("failed to read response: %w", err)
+		case line := <-w.lineChan:
 			var resp jsonRPCResponse
-			if err := json.Unmarshal([]byte(result.line), &resp); err != nil {
-				log.Debugf("droid pool: skipping malformed line: %s", result.line)
+			if err := json.Unmarshal([]byte(line), &resp); err != nil {
 				continue
 			}
 
 			if resp.ID == expectedID {
 				return &resp, nil
 			}
+		case <-time.After(30 * time.Second):
+			return nil, fmt.Errorf("timeout waiting for response line")
 		}
 	}
 }
 
 func (w *DroidWorker) readUntilCompletion(ctx context.Context, msgID string) (string, error) {
-	type readResult struct {
-		line string
-		err  error
-	}
-
 	var finalText string
 	timeout := 120 * time.Second // 2 min timeout for LLM response
 
@@ -458,57 +470,83 @@ func (w *DroidWorker) readUntilCompletion(ctx context.Context, msgID string) (st
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
-		default:
-		}
-
-		// Read with timeout using goroutine
-		lineCh := make(chan readResult, 1)
-		go func() {
-			line, err := w.stdout.ReadString('\n')
-			lineCh <- readResult{line, err}
-		}()
-
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
+		case err := <-w.errChan:
+			return "", fmt.Errorf("failed to read: %w", err)
 		case <-time.After(timeout):
 			return "", fmt.Errorf("timeout waiting for completion")
-		case result := <-lineCh:
-			if result.err != nil {
-				return "", fmt.Errorf("failed to read: %w", result.err)
-			}
+		case line := <-w.lineChan:
+			matched := false
 
-			// Try to parse as JSON-RPC response first
+			// Try to parse as JSON-RPC response first (must have ID field and type="response")
 			var resp jsonRPCResponse
-			if err := json.Unmarshal([]byte(result.line), &resp); err == nil {
+			if err := json.Unmarshal([]byte(line), &resp); err == nil && resp.ID != "" && resp.Type == "response" {
+				matched = true
 				if resp.Error != nil {
 					return "", fmt.Errorf("droid error: %s", resp.Error.Message)
 				}
-				// Initial ack response, continue reading
-				continue
+				if resp.ID == msgID {
+					// Initial ack response, continue reading
+					continue
+				}
 			}
 
-			// Try to parse as stream event
-			var event streamEvent
-			if err := json.Unmarshal([]byte(result.line), &event); err != nil {
-				log.Debugf("droid pool: skipping unknown line: %s", result.line)
-				continue
+			// Try to parse as JSON-RPC notification
+			if !matched {
+				var note jsonRPCNotification
+				if err := json.Unmarshal([]byte(line), &note); err == nil && note.Method == "droid.session_notification" {
+					matched = true
+					payload := note.Params.Notification
+
+					// Accumulate assistant text
+					if payload.Type == "create_message" && payload.Message != nil && payload.Message.Role == "assistant" {
+						for _, content := range payload.Message.Content {
+							if content.Type == "text" {
+								finalText += content.Text
+							}
+						}
+					}
+
+					// Check for completion (state becomes idle)
+					if payload.Type == "droid_working_state_changed" && payload.NewState == "idle" {
+						return finalText, nil
+					}
+					continue
+				}
 			}
 
-			// Check for errors
-			if event.Error != nil {
-				return "", fmt.Errorf("stream error: %s", event.Error.Message)
+			// Fallback: Try to parse as stream event (legacy/mixed mode)
+			if !matched {
+				type streamEvent struct {
+					Type      string `json:"type"`
+					FinalText string `json:"finalText,omitempty"`
+					Text      string `json:"text,omitempty"`
+					Role      string `json:"role,omitempty"`
+					Error     *struct {
+						Message string `json:"message"`
+					} `json:"error,omitempty"`
+				}
+				var event streamEvent
+				if err := json.Unmarshal([]byte(line), &event); err == nil && event.Type != "" {
+					matched = true
+					if event.Error != nil {
+						return "", fmt.Errorf("stream error: %s", event.Error.Message)
+					}
+					if event.Type == "completion" {
+						return event.FinalText, nil
+					}
+					if event.Type == "message" && event.Role == "assistant" && event.Text != "" {
+						finalText = event.Text
+					}
+				}
 			}
 
-			// Check for completion
-			if event.Type == "completion" {
-				finalText = event.FinalText
-				return finalText, nil
-			}
-
-			// Check for assistant message (fallback)
-			if event.Type == "message" && event.Role == "assistant" && event.Text != "" {
-				finalText = event.Text
+			// Warn on unrecognized format to help diagnose protocol issues
+			if !matched {
+				if len(line) > 200 {
+					log.Warnf("droid pool: unrecognized JSON line (truncated): %.200s...", line)
+				} else {
+					log.Warnf("droid pool: unrecognized JSON line: %s", line)
+				}
 			}
 		}
 	}
@@ -528,6 +566,14 @@ func (w *DroidWorker) Close() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// Stop background reader
+	select {
+	case <-w.stopReader:
+		// Already closed
+	default:
+		close(w.stopReader)
+	}
+
 	if w.stdin != nil {
 		w.stdin.Close()
 	}
@@ -539,4 +585,36 @@ func (w *DroidWorker) Close() {
 		w.cmd.Wait()
 	}
 	log.Debugf("droid pool: worker %d closed", w.id)
+}
+
+// backgroundReader continuously reads from stdout to prevent pipe blocking
+func (w *DroidWorker) backgroundReader() {
+	for {
+		select {
+		case <-w.stopReader:
+			return
+		default:
+		}
+
+		line, err := w.stdout.ReadString('\n')
+		if err != nil {
+			select {
+			case w.errChan <- err:
+			default:
+			}
+			return
+		}
+
+		// Normalize line endings (Windows CRLF -> LF)
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			continue
+		}
+
+		select {
+		case w.lineChan <- line:
+		case <-w.stopReader:
+			return
+		}
+	}
 }

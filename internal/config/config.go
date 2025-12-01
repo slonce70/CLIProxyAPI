@@ -210,6 +210,9 @@ type DroidKey struct {
 
 	// PoolSize sets the number of persistent droid processes (default: 3).
 	PoolSize int `yaml:"pool-size,omitempty" json:"pool-size,omitempty"`
+
+	// SessionTTL is the session timeout in minutes (default: 30).
+	SessionTTL int `yaml:"session-ttl,omitempty" json:"session-ttl,omitempty"`
 }
 
 // GeminiKey represents the configuration for a Gemini API key,

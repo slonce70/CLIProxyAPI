@@ -18,16 +18,52 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// droidDisabledTools contains all tools to disable for chat-only mode.
+// We disable everything to use droid as a simple text completion API.
+// Format: comma-separated list per --disabled-tools flag.
+const droidDisabledTools = "" +
+	// Core droid tools
+	"Read,LS,Execute,Grep,Glob,Create,Edit,WebSearch,FetchUrl,TodoWrite," +
+	"ExitSpecMode,GenerateDroid,store_agent_readiness_report,slack_post_message," +
+	// MCP: brave-search (web searches)
+	"brave-search___brave_web_search,brave-search___brave_local_search," +
+	"brave-search___brave_news_search,brave-search___brave_video_search," +
+	"brave-search___brave_image_search,brave-search___brave_summarizer," +
+	// MCP: chrome-devtools (browser automation - MUST disable to prevent browser opening)
+	"chrome-devtools___click,chrome-devtools___close_page,chrome-devtools___drag," +
+	"chrome-devtools___emulate,chrome-devtools___evaluate_script,chrome-devtools___fill," +
+	"chrome-devtools___fill_form,chrome-devtools___get_console_message," +
+	"chrome-devtools___get_network_request,chrome-devtools___handle_dialog," +
+	"chrome-devtools___hover,chrome-devtools___list_console_messages," +
+	"chrome-devtools___list_network_requests,chrome-devtools___list_pages," +
+	"chrome-devtools___navigate_page,chrome-devtools___new_page," +
+	"chrome-devtools___performance_analyze_insight,chrome-devtools___performance_start_trace," +
+	"chrome-devtools___performance_stop_trace,chrome-devtools___press_key," +
+	"chrome-devtools___resize_page,chrome-devtools___select_page," +
+	"chrome-devtools___take_screenshot,chrome-devtools___take_snapshot," +
+	"chrome-devtools___upload_file,chrome-devtools___wait_for," +
+	// MCP: context7 (documentation lookup)
+	"context7___get-library-docs,context7___resolve-library-id"
+
 // DroidExecutor wraps Factory Droid CLI to provide OpenAI-compatible API access.
 type DroidExecutor struct {
-	cfg       *config.Config
-	droidPath string
-	pool      *DroidProcessPool
-	poolMu    sync.Mutex
+	cfg            *config.Config
+	droidPath      string
+	pool           *DroidProcessPool
+	poolMu         sync.Mutex
+	sessionManager *DroidSessionManager
 }
 
 func NewDroidExecutor(cfg *config.Config) *DroidExecutor {
-	return &DroidExecutor{cfg: cfg, droidPath: "droid"}
+	var sessionTTL time.Duration = 30 * time.Minute
+	if cfg != nil && len(cfg.DroidKey) > 0 && cfg.DroidKey[0].SessionTTL > 0 {
+		sessionTTL = time.Duration(cfg.DroidKey[0].SessionTTL) * time.Minute
+	}
+	return &DroidExecutor{
+		cfg:            cfg,
+		droidPath:      "droid",
+		sessionManager: NewDroidSessionManager(sessionTTL),
+	}
 }
 
 // InitPool initializes the process pool for faster request handling
@@ -75,36 +111,162 @@ func (e *DroidExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return cliproxyexecutor.Response{}, fmt.Errorf("droid: missing FACTORY_API_KEY")
 	}
 
-	prompt, model, reasoningEffort, err := extractDroidPromptAndModel(req.Payload, req.Model)
+	// Parse conversation
+	conv, err := extractDroidConversation(req.Payload, req.Model)
 	if err != nil {
-		return cliproxyexecutor.Response{}, fmt.Errorf("droid: failed to extract prompt: %w", err)
+		return cliproxyexecutor.Response{}, fmt.Errorf("droid: failed to extract conversation: %w", err)
 	}
 
-	// Try pool-based execution first (much faster)
-	if result, err := e.executeWithPool(ctx, apiKey, model, prompt); err == nil {
-		response := convertDroidToOpenAIResponse(result, model)
+	// Try session-based execution first (no token duplication)
+	if result, err := e.executeWithSession(ctx, apiKey, conv); err == nil {
+		response := convertDroidToOpenAIResponse(result, conv.Model)
 		payload, err := json.Marshal(response)
 		if err != nil {
 			return cliproxyexecutor.Response{}, fmt.Errorf("droid: failed to marshal response: %w", err)
 		}
 		return cliproxyexecutor.Response{Payload: payload}, nil
 	} else {
-		log.Debugf("droid: pool execution failed, falling back to subprocess: %v", err)
+		log.Debugf("droid: session execution failed, falling back to subprocess: %v", err)
 	}
 
-	// Fallback to subprocess execution
-	result, err := executeDroidJSON(ctx, e.droidPath, apiKey, model, reasoningEffort, prompt)
+	// Log request details for debugging token usage
+	promptLen := len(conv.FullPrompt)
+	log.Infof("droid: request model=%s reasoning=%s prompt_chars=%d (~%d tokens)", conv.Model, conv.ReasoningEffort, promptLen, promptLen/4)
+
+	// Fallback to subprocess execution (sends full conversation each time)
+	result, err := executeDroidJSON(ctx, e.droidPath, apiKey, conv.Model, conv.ReasoningEffort, conv.FullPrompt)
 	if err != nil {
+		log.Warnf("droid: execution failed: %v", err)
 		return cliproxyexecutor.Response{}, fmt.Errorf("droid: execution failed: %w", err)
 	}
 
-	response := convertDroidToOpenAIResponse(result, model)
+	// Log response details
+	resultLen := len(result.Result)
+	log.Infof("droid: response duration=%dms result_chars=%d (~%d tokens) turns=%d", result.DurationMs, resultLen, resultLen/4, result.NumTurns)
+
+	response := convertDroidToOpenAIResponse(result, conv.Model)
 	payload, err := json.Marshal(response)
 	if err != nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("droid: failed to marshal response: %w", err)
 	}
 
 	return cliproxyexecutor.Response{Payload: payload}, nil
+}
+
+// executeWithSession uses session management for efficient multi-turn conversations
+func (e *DroidExecutor) executeWithSession(ctx context.Context, apiKey string, conv *droidConversation) (*droidJSONResult, error) {
+	if e.sessionManager == nil {
+		return nil, fmt.Errorf("session manager not initialized")
+	}
+
+	// Need system prompt to identify session
+	if conv.SystemPrompt == "" {
+		return nil, fmt.Errorf("no system prompt for session management")
+	}
+
+	// Get or create session
+	session, existed := e.sessionManager.GetOrCreateSession(conv.SystemPrompt, conv.Model)
+
+	// Try to use existing pool or create one
+	e.poolMu.Lock()
+	pool := e.pool
+	if pool == nil && e.cfg != nil && len(e.cfg.DroidKey) > 0 {
+		droidCfg := e.cfg.DroidKey[0]
+		if droidCfg.PoolEnabled {
+			poolSize := droidCfg.PoolSize
+			if poolSize <= 0 {
+				poolSize = 3
+			}
+			cwd, _ := os.Getwd()
+			pool = NewDroidProcessPool(poolSize, apiKey, conv.Model, cwd)
+			e.pool = pool
+			log.Infof("droid: lazy-initialized process pool with size %d", poolSize)
+		}
+	}
+	e.poolMu.Unlock()
+
+	if pool == nil {
+		return nil, fmt.Errorf("pool not enabled")
+	}
+
+	// Get or create worker for this session
+	session.mu.Lock()
+	worker := session.Worker
+	if worker == nil || !worker.isAlive() {
+		// Acquire new worker
+		var err error
+		worker, err = pool.Acquire(ctx)
+		if err != nil {
+			session.mu.Unlock()
+			return nil, fmt.Errorf("failed to acquire worker: %w", err)
+		}
+		session.Worker = worker
+		existed = false // Need to send full context
+	}
+	session.mu.Unlock()
+
+	startTime := time.Now()
+	var response string
+	var err error
+
+	if !existed || len(session.GetMessages()) == 0 {
+		// New session - send full context as first message
+		log.Debugf("droid session: new session %s, sending full context (%d chars)", session.ID, len(conv.FullPrompt))
+		response, err = worker.SendMessage(ctx, conv.FullPrompt)
+		if err != nil {
+			pool.ReleaseWithError(worker, err)
+			session.mu.Lock()
+			session.Worker = nil
+			session.mu.Unlock()
+			return nil, err
+		}
+		// Save messages to session
+		session.SetMessages(conv.Messages)
+	} else {
+		// Existing session - find and send only new messages
+		newMessages := session.FindNewMessages(conv.Messages)
+		if len(newMessages) == 0 {
+			return nil, fmt.Errorf("no new messages to send")
+		}
+
+		// Build prompt from new messages only
+		var sb strings.Builder
+		for _, msg := range newMessages {
+			if msg.Role == "user" {
+				sb.WriteString(msg.Content)
+				sb.WriteString("\n")
+			}
+		}
+		newPrompt := strings.TrimSpace(sb.String())
+
+		log.Debugf("droid session: existing session %s, sending delta (%d chars vs %d full)", session.ID, len(newPrompt), len(conv.FullPrompt))
+		response, err = worker.SendMessage(ctx, newPrompt)
+		if err != nil {
+			pool.ReleaseWithError(worker, err)
+			session.mu.Lock()
+			session.Worker = nil
+			session.mu.Unlock()
+			return nil, err
+		}
+		// Update session messages
+		session.SetMessages(conv.Messages)
+	}
+
+	// Add assistant response to session
+	session.AddMessages([]DroidMessage{{Role: "assistant", Content: response}})
+
+	duration := time.Since(startTime)
+	log.Infof("droid session: response from session %s, duration=%dms chars=%d", session.ID, duration.Milliseconds(), len(response))
+
+	return &droidJSONResult{
+		Type:       "result",
+		Subtype:    "success",
+		IsError:    false,
+		DurationMs: duration.Milliseconds(),
+		NumTurns:   1,
+		Result:     response,
+		SessionID:  session.ID,
+	}, nil
 }
 
 // executeWithPool tries to execute using the process pool
@@ -209,80 +371,73 @@ type droidOpenAIMessage struct {
 	Content string `json:"content"`
 }
 
-func extractDroidPromptAndModel(payload []byte, defaultModel string) (prompt string, model string, reasoningEffort string, err error) {
+// droidConversation holds parsed conversation data
+type droidConversation struct {
+	Model           string
+	ReasoningEffort string
+	SystemPrompt    string
+	Messages        []DroidMessage
+	FullPrompt      string
+}
+
+func extractDroidConversation(payload []byte, defaultModel string) (*droidConversation, error) {
 	var req droidOpenAIRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
-		return "", "", "", err
+		return nil, err
 	}
 
-	model = req.Model
+	model := req.Model
 	if model == "" {
 		model = defaultModel
 	}
 	if model == "" {
 		model = "claude-opus-4-5-20251101"
 	}
-	model, reasoningEffort = mapDroidModel(model)
+	model, reasoningEffort := mapDroidModel(model)
 
-	// Build prompt preserving conversation context
-	// Format that LLMs understand well for multi-turn conversations
-	var promptBuilder strings.Builder
-	var systemPrompt string
-	var hasHistory bool
-
-	// Extract system prompt first
-	for _, msg := range req.Messages {
-		if msg.Role == "system" {
-			systemPrompt = msg.Content
-			break
-		}
+	conv := &droidConversation{
+		Model:           model,
+		ReasoningEffort: reasoningEffort,
+		Messages:        make([]DroidMessage, 0, len(req.Messages)),
 	}
 
-	// Check if we have conversation history (more than just the last user message)
-	userMsgCount := 0
-	for _, msg := range req.Messages {
-		if msg.Role == "user" || msg.Role == "assistant" {
-			userMsgCount++
+	// Extract system prompt (first message if it contains SYSTEM: or role=system)
+	// and build messages list
+	var sb strings.Builder
+	for i, msg := range req.Messages {
+		if msg.Content == "" {
+			continue
 		}
-	}
-	hasHistory = userMsgCount > 1
 
-	// Add system prompt if present
-	if systemPrompt != "" {
-		promptBuilder.WriteString("<system>\n")
-		promptBuilder.WriteString(systemPrompt)
-		promptBuilder.WriteString("\n</system>\n\n")
-	}
+		conv.Messages = append(conv.Messages, DroidMessage{
+			Role:    msg.Role,
+			Content: msg.Content,
+		})
 
-	// Add conversation history if present
-	if hasHistory {
-		promptBuilder.WriteString("<conversation_history>\n")
-		for _, msg := range req.Messages {
-			switch msg.Role {
-			case "system":
-				continue // Already handled
-			case "user":
-				promptBuilder.WriteString("[User]: ")
-				promptBuilder.WriteString(msg.Content)
-				promptBuilder.WriteString("\n\n")
-			case "assistant":
-				promptBuilder.WriteString("[Assistant]: ")
-				promptBuilder.WriteString(msg.Content)
-				promptBuilder.WriteString("\n\n")
-			}
+		// First user message with SYSTEM: prefix or system role is the system prompt
+		if i == 0 && (msg.Role == "system" || strings.HasPrefix(msg.Content, "SYSTEM:")) {
+			conv.SystemPrompt = msg.Content
 		}
-		promptBuilder.WriteString("</conversation_history>\n\n")
-		promptBuilder.WriteString("Continue the conversation. Respond to the last user message.")
-	} else {
-		// Single message - just use it directly
-		for _, msg := range req.Messages {
-			if msg.Role == "user" {
-				promptBuilder.WriteString(msg.Content)
-			}
-		}
+
+		// Build full prompt for subprocess fallback
+		role := strings.ToUpper(msg.Role)
+		sb.WriteString(role)
+		sb.WriteString(": ")
+		sb.WriteString(msg.Content)
+		sb.WriteString("\n\n")
 	}
 
-	return strings.TrimSpace(promptBuilder.String()), model, reasoningEffort, nil
+	conv.FullPrompt = strings.TrimSpace(sb.String())
+	return conv, nil
+}
+
+// extractDroidPromptAndModel is a compatibility wrapper
+func extractDroidPromptAndModel(payload []byte, defaultModel string) (prompt string, model string, reasoningEffort string, err error) {
+	conv, err := extractDroidConversation(payload, defaultModel)
+	if err != nil {
+		return "", "", "", err
+	}
+	return conv.FullPrompt, conv.Model, conv.ReasoningEffort, nil
 }
 
 // mapDroidModel returns the native model name and reasoning effort level.
@@ -326,7 +481,20 @@ type droidJSONResult struct {
 }
 
 func executeDroidJSON(ctx context.Context, droidPath, apiKey, model, reasoningEffort, prompt string) (*droidJSONResult, error) {
-	args := []string{"exec", "-o", "json"}
+	// Use temporary file for prompt to avoid command line length limits
+	tmpFile, err := os.CreateTemp("", "droid-prompt-*.txt")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.WriteString(prompt); err != nil {
+		tmpFile.Close()
+		return nil, fmt.Errorf("failed to write to temp file: %w", err)
+	}
+	tmpFile.Close()
+
+	args := []string{"exec", "--output-format", "json"}
 	if model != "" {
 		args = append(args, "-m", model)
 	}
@@ -339,23 +507,14 @@ func executeDroidJSON(ctx context.Context, droidPath, apiKey, model, reasoningEf
 		}
 	}
 
-	// Disable tools to reduce LLM prompt size and improve response time (~1 sec faster)
-	// Tool names from: droid exec --list-tools
-	args = append(args, "--disabled-tools", "Read,LS,Execute,Grep,Glob,WebSearch,FetchUrl,TodoWrite")
+	// Disable all tools for chat-only mode (see droidDisabledTools constant)
+	args = append(args, "--disabled-tools", droidDisabledTools)
 
-	// Pass prompt via stdin to avoid Windows command line length limits
-	// Only add prompt as argument if it's short enough
-	if len(prompt) < 4000 {
-		args = append(args, prompt)
-	}
+	// Pass prompt via file
+	args = append(args, "-f", tmpFile.Name())
 
 	cmd := exec.CommandContext(ctx, droidPath, args...)
 	cmd.Env = append(os.Environ(), "FACTORY_API_KEY="+apiKey)
-
-	// For long prompts, pass via stdin
-	if len(prompt) >= 4000 {
-		cmd.Stdin = strings.NewReader(prompt)
-	}
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -367,7 +526,16 @@ func executeDroidJSON(ctx context.Context, droidPath, apiKey, model, reasoningEf
 
 	var result droidJSONResult
 	if err := json.Unmarshal(output, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse droid output: %w", err)
+		// If direct unmarshal fails, try to clean up output (sometimes there might be logs mixed in)
+		// Find the last JSON object
+		lastBrace := bytes.LastIndexByte(output, '}')
+		firstBrace := bytes.LastIndexByte(output[:lastBrace+1], '{')
+		if lastBrace > firstBrace && firstBrace >= 0 {
+			if err2 := json.Unmarshal(output[firstBrace:lastBrace+1], &result); err2 == nil {
+				return &result, nil
+			}
+		}
+		return nil, fmt.Errorf("failed to parse droid output: %w (output: %s)", err, string(output))
 	}
 
 	if result.IsError {
@@ -464,35 +632,36 @@ type droidStreamEvent struct {
 }
 
 func executeDroidStreamJSON(ctx context.Context, droidPath, apiKey, model, reasoningEffort, prompt string, ch chan<- cliproxyexecutor.StreamChunk) error {
-	args := []string{"exec", "-o", "stream-json"}
+	// Use temporary file for prompt
+	tmpFile, err := os.CreateTemp("", "droid-prompt-stream-*.txt")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.WriteString(prompt); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("failed to write to temp file: %w", err)
+	}
+	tmpFile.Close()
+
+	args := []string{"exec", "--output-format", "stream-json"}
 	if model != "" {
 		args = append(args, "-m", model)
 	}
 	if reasoningEffort != "" {
 		args = append(args, "-r", reasoningEffort)
 	} else {
-		// Disable reasoning by default for faster responses (except GLM which doesn't support it)
 		if model != "glm-4.6" {
 			args = append(args, "-r", "off")
 		}
 	}
 
-	// Disable tools to reduce LLM prompt size and improve response time (~1 sec faster)
-	// Tool names from: droid exec --list-tools
-	args = append(args, "--disabled-tools", "Read,LS,Execute,Grep,Glob,WebSearch,FetchUrl,TodoWrite")
-
-	// Pass prompt via stdin to avoid Windows command line length limits
-	if len(prompt) < 4000 {
-		args = append(args, prompt)
-	}
+	args = append(args, "--disabled-tools", droidDisabledTools)
+	args = append(args, "-f", tmpFile.Name())
 
 	cmd := exec.CommandContext(ctx, droidPath, args...)
 	cmd.Env = append(os.Environ(), "FACTORY_API_KEY="+apiKey)
-
-	// For long prompts, pass via stdin
-	if len(prompt) >= 4000 {
-		cmd.Stdin = strings.NewReader(prompt)
-	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
