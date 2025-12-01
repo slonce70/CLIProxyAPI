@@ -1138,6 +1138,31 @@ func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 			applyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
 			out = append(out, a)
 		}
+		// Droid API keys -> synthesize auths
+		for i := range cfg.DroidKey {
+			dk := cfg.DroidKey[i]
+			key := strings.TrimSpace(dk.APIKey)
+			if key == "" {
+				continue
+			}
+			id, token := idGen.next("droid:apikey", key)
+			attrs := map[string]string{
+				"source":    fmt.Sprintf("config:droid[%s]", token),
+				"api_key":   key,
+				"auth_kind": "apikey",
+			}
+			a := &coreauth.Auth{
+				ID:         id,
+				Provider:   "droid",
+				Label:      "droid-apikey",
+				Status:     coreauth.StatusActive,
+				Attributes: attrs,
+				CreatedAt:  now,
+				UpdatedAt:  now,
+			}
+			applyAuthExcludedModelsMeta(a, cfg, dk.ExcludedModels, "apikey")
+			out = append(out, a)
+		}
 		for i := range cfg.OpenAICompatibility {
 			compat := &cfg.OpenAICompatibility[i]
 			providerName := strings.ToLower(strings.TrimSpace(compat.Name))
