@@ -25,6 +25,7 @@ Get 10% OFF GLM CODING PLAN：https://z.ai/subscribe?ic=8JVLJQFSKB
 - Claude Code support via OAuth login
 - Qwen Code support via OAuth login
 - iFlow support via OAuth login
+- Factory Droid support (Claude 4.5, GPT-5.1, Gemini 3, GLM-4.6) via API key
 - Amp CLI and IDE extensions support with provider routing
 - Streaming and non-streaming responses
 - Function calling/tools support
@@ -38,6 +39,7 @@ Get 10% OFF GLM CODING PLAN：https://z.ai/subscribe?ic=8JVLJQFSKB
 - Qwen Code multi-account load balancing
 - iFlow multi-account load balancing
 - OpenAI Codex multi-account load balancing
+- Factory Droid multi-account load balancing
 - OpenAI-compatible upstream providers via config (e.g., OpenRouter)
 - Reusable Go SDK for embedding the proxy (see `docs/sdk-usage.md`)
 
