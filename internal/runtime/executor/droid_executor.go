@@ -541,7 +541,15 @@ func executeDroidJSON(ctx context.Context, droidPath, apiKey, model, reasoningEf
 	args = append(args, "-f", tmpFile.Name())
 
 	cmd := exec.CommandContext(ctx, droidPath, args...)
-	cmd.Env = append(os.Environ(), "FACTORY_API_KEY="+apiKey)
+	// Build clean environment, replacing any existing FACTORY_API_KEY
+	env := make([]string, 0, len(os.Environ())+1)
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, "FACTORY_API_KEY=") {
+			env = append(env, e)
+		}
+	}
+	env = append(env, "FACTORY_API_KEY="+apiKey)
+	cmd.Env = env
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -688,7 +696,15 @@ func executeDroidStreamJSON(ctx context.Context, droidPath, apiKey, model, reaso
 	args = append(args, "-f", tmpFile.Name())
 
 	cmd := exec.CommandContext(ctx, droidPath, args...)
-	cmd.Env = append(os.Environ(), "FACTORY_API_KEY="+apiKey)
+	// Build clean environment, replacing any existing FACTORY_API_KEY
+	envStream := make([]string, 0, len(os.Environ())+1)
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, "FACTORY_API_KEY=") {
+			envStream = append(envStream, e)
+		}
+	}
+	envStream = append(envStream, "FACTORY_API_KEY="+apiKey)
+	cmd.Env = envStream
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

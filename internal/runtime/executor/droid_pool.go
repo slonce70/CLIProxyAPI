@@ -299,7 +299,16 @@ func (p *DroidProcessPool) createWorker(ctx context.Context) (*DroidWorker, erro
 
 	// Use background context for the process - it should live beyond any single request
 	cmd := exec.Command("droid", args...)
-	cmd.Env = append(os.Environ(), "FACTORY_API_KEY="+p.apiKey)
+
+	// Build clean environment, replacing any existing FACTORY_API_KEY
+	env := make([]string, 0, len(os.Environ())+1)
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, "FACTORY_API_KEY=") {
+			env = append(env, e)
+		}
+	}
+	env = append(env, "FACTORY_API_KEY="+p.apiKey)
+	cmd.Env = env
 	cmd.Dir = p.cwd
 
 	stdin, err := cmd.StdinPipe()
