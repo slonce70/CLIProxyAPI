@@ -192,18 +192,42 @@ func (e *DroidExecutor) executeWithSession(ctx context.Context, apiKey string, c
 	// Get or create worker for this session
 	session.mu.Lock()
 	worker := session.Worker
-	if worker == nil || !worker.isAlive() {
-		// Acquire new worker
+	if worker != nil && worker.isAlive() {
+		// Session has an existing worker, try to use it
+		if worker.busy.CompareAndSwap(false, true) {
+			// Successfully acquired the worker
+			session.mu.Unlock()
+		} else {
+			// Worker is busy (concurrent request to same session), wait for it
+			session.mu.Unlock()
+			// Wait with timeout for worker to become available
+			waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			for {
+				select {
+				case <-waitCtx.Done():
+					return nil, fmt.Errorf("timeout waiting for session worker")
+				case <-time.After(100 * time.Millisecond):
+					if worker.busy.CompareAndSwap(false, true) {
+						goto workerAcquired
+					}
+				}
+			}
+		}
+	} else {
+		// Need new worker from pool
+		session.mu.Unlock()
 		var err error
 		worker, err = pool.Acquire(ctx)
 		if err != nil {
-			session.mu.Unlock()
 			return nil, fmt.Errorf("failed to acquire worker: %w", err)
 		}
+		session.mu.Lock()
 		session.Worker = worker
 		existed = false // Need to send full context
+		session.mu.Unlock()
 	}
-	session.mu.Unlock()
+workerAcquired:
 
 	startTime := time.Now()
 	var response string
@@ -254,6 +278,9 @@ func (e *DroidExecutor) executeWithSession(ctx context.Context, apiKey string, c
 
 	// Add assistant response to session
 	session.AddMessages([]DroidMessage{{Role: "assistant", Content: response}})
+
+	// Release worker back to pool (but keep reference in session for potential reuse)
+	worker.busy.Store(false)
 
 	duration := time.Since(startTime)
 	log.Infof("droid session: response from session %s, duration=%dms chars=%d", session.ID, duration.Milliseconds(), len(response))
